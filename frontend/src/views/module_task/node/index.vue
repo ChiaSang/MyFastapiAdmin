@@ -1,39 +1,5 @@
 <template>
   <div class="app-container">
-    <div class="search-container">
-      <el-form
-        ref="queryFormRef"
-        :model="queryFormData"
-        :inline="true"
-        label-suffix=":"
-        @submit.prevent="handleQuery"
-      >
-        <el-form-item prop="name" label="节点名称">
-          <el-input v-model="queryFormData.name" placeholder="请输入节点名称" clearable />
-        </el-form-item>
-        <el-form-item prop="code" label="节点编码">
-          <el-input v-model="queryFormData.code" placeholder="请输入节点编码" clearable />
-        </el-form-item>
-        <el-form-item class="search-buttons">
-          <el-button
-            v-hasPerm="['module_task:node:query']"
-            type="primary"
-            icon="search"
-            native-type="submit"
-          >
-            查询
-          </el-button>
-          <el-button
-            v-hasPerm="['module_task:node:query']"
-            icon="refresh"
-            @click="handleResetQuery"
-          >
-            重置
-          </el-button>
-        </el-form-item>
-      </el-form>
-    </div>
-
     <el-card class="data-table">
       <template #header>
         <div class="card-header">
@@ -43,6 +9,39 @@
             </el-tooltip>
             节点类型列表
           </span>
+          <div class="search-container">
+            <el-form
+              ref="queryFormRef"
+              :model="queryFormData"
+              :inline="true"
+              label-suffix=":"
+              @submit.prevent="handleQuery"
+            >
+              <el-form-item prop="name" label="节点名称">
+                <el-input v-model="queryFormData.name" placeholder="请输入节点名称" clearable />
+              </el-form-item>
+              <el-form-item prop="code" label="节点编码">
+                <el-input v-model="queryFormData.code" placeholder="请输入节点编码" clearable />
+              </el-form-item>
+              <el-form-item class="search-buttons">
+                <el-button
+                  v-hasPerm="['module_task:node:query']"
+                  type="primary"
+                  icon="search"
+                  native-type="submit"
+                >
+                  查询
+                </el-button>
+                <el-button
+                  v-hasPerm="['module_task:node:query']"
+                  icon="refresh"
+                  @click="handleResetQuery"
+                >
+                  重置
+                </el-button>
+              </el-form-item>
+            </el-form>
+          </div>
         </div>
       </template>
 
@@ -89,8 +88,8 @@
         :data="pageTableData"
         class="data-table__content"
         highlight-current-row
-        height="450"
-        max-height="450"
+        height="calc(100vh - 440px)"
+        max-height="calc(100vh - 440px)"
         border
         stripe
         @selection-change="handleSelectionChange"
@@ -114,6 +113,7 @@
           <template #default="scope">
             <el-space class="flex">
               <el-button
+                v-hasPerm="['module_task:node:execute']"
                 type="warning"
                 size="small"
                 link
@@ -203,7 +203,7 @@
               </el-form-item>
               <el-form-item label="位置参数" prop="args">
                 <div class="dynamic-params">
-                  <div v-for="(item, index) in argsList" :key="index" class="param-item">
+                  <div v-for="(_item, index) in argsList" :key="index" class="param-item">
                     <el-input v-model="argsList[index]" placeholder="参数值" />
                     <el-button
                       type="danger"
@@ -285,7 +285,7 @@
     <el-dialog
       v-model="executeDialogVisible"
       title="调试节点"
-      width="600px"
+      width="700px"
       @close="handleCloseExecuteDialog"
     >
       <el-form
@@ -300,7 +300,7 @@
         </el-form-item>
         <el-form-item label="执行方式" prop="trigger">
           <el-radio-group v-model="executeFormData.trigger">
-            <el-radio value="now">一次性任务</el-radio>
+            <el-radio value="now">立即执行</el-radio>
             <el-radio value="cron">Cron表达式</el-radio>
             <el-radio value="interval">时间间隔</el-radio>
             <el-radio value="date">固定日期</el-radio>
@@ -314,10 +314,10 @@
         >
           <el-popover
             :visible="openCron"
-            width="600px"
+            width="700px"
             trigger="click"
             :persistent="false"
-            placement="left"
+            placement="auto-end"
           >
             <template #reference>
               <el-input
@@ -337,10 +337,10 @@
         >
           <el-popover
             :visible="openInterval"
-            width="500px"
+            width="600px"
             trigger="click"
             :persistent="false"
-            placement="left"
+            placement="auto-end"
           >
             <template #reference>
               <el-input
@@ -404,7 +404,7 @@
 
       <template #footer>
         <el-button @click="handleCloseExecuteDialog">取消</el-button>
-        <el-button type="primary" @click="handleExecuteNode">确认调试</el-button>
+        <el-button type="primary" @click="handleExecuteNode">确认</el-button>
       </template>
     </el-dialog>
   </div>
@@ -418,8 +418,7 @@ defineOptions({
 
 import NodeAPI, { NodeTable, NodeForm, NodePageQuery, TriggerType } from "@/api/module_task/node";
 import { useDictStore } from "@/store/index";
-import { nextTick, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { nextTick, onMounted, reactive, ref } from "vue";
 import { vue3CronPlus } from "vue3-cron-plus";
 import "vue3-cron-plus/dist/index.css";
 import OperationColumn from "@/components/OperationColumn/index.vue";
@@ -430,7 +429,6 @@ import "codemirror/mode/python/python.js";
 import "codemirror/theme/dracula.css";
 
 const dictStore = useDictStore();
-const router = useRouter();
 
 const codeEditorOptions: EditorConfiguration = {
   mode: "python",
@@ -653,11 +651,17 @@ async function handleSubmit() {
 }
 
 async function handleDelete(ids: number[]) {
-  ElMessageBox.confirm("确认删除该项数据?", "警告", {
-    confirmButtonText: "确定",
-    cancelButtonText: "取消",
-    type: "warning",
-  })
+  ElMessageBox.confirm(
+    "确认删除选中的节点吗？\n" +
+      "此操作将同时删除节点定义并移除调度器中的相关任务。\n" +
+      "正在运行的任务会被立即移除，待执行任务的日志将被标记为已取消。",
+    "警告",
+    {
+      confirmButtonText: "确定",
+      cancelButtonText: "取消",
+      type: "warning",
+    }
+  )
     .then(async () => {
       try {
         loading.value = true;
@@ -721,34 +725,11 @@ async function handleExecuteNode() {
     }
 
     await NodeAPI.executeNode(currentExecuteNode.value?.id as number, params);
-    ElMessage.success({
-      message: `节点调试${executeFormData.trigger === "now" ? "已启动" : "已创建"}`,
-      type: "success",
-      duration: 2000,
-    });
 
     handleCloseExecuteDialog();
 
     // 重新加载数据
     await loadingData();
-
-    // 如果是立即执行，提示用户查看执行记录
-    if (executeFormData.trigger === "now") {
-      ElMessageBox.confirm("调试任务已启动，是否跳转到执行记录页面查看执行结果？", "提示", {
-        confirmButtonText: "查看记录",
-        cancelButtonText: "稍后查看",
-        type: "info",
-      })
-        .then(() => {
-          // 跳转到执行记录页面
-          router.push({
-            path: "/task/job",
-          });
-        })
-        .catch(() => {
-          // 取消操作
-        });
-    }
   } catch (error: any) {
     ElMessage.error({
       message: error.response?.data?.msg || "调试失败",
@@ -811,5 +792,17 @@ onMounted(async () => {
   word-break: break-all;
   white-space: pre-wrap;
   border-radius: 4px;
+}
+
+.execution-log-drawer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.pagination-container {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
 }
 </style>

@@ -79,6 +79,9 @@ class SchedulerUtil:
     """
 
     redis_instance: Redis | None = None
+    # 临时存储 job_name，用于在 EVENT_JOB_SUBMITTED 时获取
+    # 格式可以是: str (任务名称) 或 tuple[str, str] (原任务ID, 任务名称)
+    _job_name_cache: dict[str, str | tuple[str, str]] = {}
 
     @classmethod
     def scheduler_event_listener(cls, event: JobEvent | JobExecutionEvent) -> None:
@@ -135,16 +138,43 @@ class SchedulerUtil:
         if job:
             log.info(f"任务 {job_id} ({job.name}) 已提交执行")
 
-            # 创建执行日志
-            cls._create_job_log(
-                job_id=job_id,
-                job_name=job.name,
-                trigger_type=cls._get_trigger_type(job_id),
+            trigger_type = cls._get_trigger_type(job_id)
+
+            # 周期性任务（cron/interval）：更新 pending 状态为 running
+            if trigger_type in ("cron", "interval"):
+                cls._update_job_log(
+                    job_id=job_id,
+                    status="running",
+                )
+            else:
+                # 一次性任务（manual/date）：创建新的 running 状态日志
+                cls._create_job_log(
+                    job_id=job_id,
+                    job_name=job.name,
+                    trigger_type=trigger_type,
+                    status="running",
+                )
+        else:
+            # 任务可能已经被移除（一次性任务执行完毕后自动移除）
+            # 尝试从缓存获取 job_name 和原任务 ID
+            cached_value = cls._job_name_cache.pop(job_id, None)
+            # 处理新的缓存格式 (原任务ID, 任务名称) 或旧的格式 任务名称
+            if isinstance(cached_value, tuple):
+                original_job_id, job_name = cached_value
+            else:
+                original_job_id, job_name = job_id, cached_value
+
+            log.info(f"任务 {job_id} 提交执行，但未找到任务信息（可能已被移除），尝试创建日志")
+            result = cls._create_job_log(
+                job_id=original_job_id,
+                job_name=job_name,
+                trigger_type="manual",
                 status="running",
             )
-        else:
-            # 任务可能已经被移除（一次性任务），尝试从事件中获取信息
-            log.debug(f"任务 {job_id} 提交执行，但未找到任务信息（可能已被移除）")
+            if result:
+                log.info(f"任务 {original_job_id} 日志创建成功，id={result}")
+            else:
+                log.error(f"任务 {original_job_id} 日志创建失败")
 
     @classmethod
     def _handle_job_executed(cls, event: JobExecutionEvent) -> None:
@@ -167,6 +197,19 @@ class SchedulerUtil:
             status="success",
             result=str(retval) if retval else None,
         )
+
+        # 为周期性任务创建新的 pending 状态日志，等待下次执行
+        job = cls.get_job(job_id=job_id)
+        if job:
+            trigger_type = cls._get_trigger_type(job_id)
+            if trigger_type in ("cron", "interval") and job.next_run_time:
+                cls._create_job_log(
+                    job_id=job_id,
+                    job_name=job.name,
+                    trigger_type=trigger_type,
+                    status="pending",
+                )
+                log.debug(f"任务 {job_id} 已创建新的 pending 状态日志，等待下次执行")
 
     @classmethod
     def _handle_job_error(cls, event: JobExecutionEvent) -> None:
@@ -192,6 +235,19 @@ class SchedulerUtil:
             error=str(exception) if exception else "未知错误",
         )
 
+        # 为周期性任务创建新的 pending 状态日志，等待下次执行
+        job = cls.get_job(job_id=job_id)
+        if job:
+            trigger_type = cls._get_trigger_type(job_id)
+            if trigger_type in ("cron", "interval") and job.next_run_time:
+                cls._create_job_log(
+                    job_id=job_id,
+                    job_name=job.name,
+                    trigger_type=trigger_type,
+                    status="pending",
+                )
+                log.debug(f"任务 {job_id} 已创建新的 pending 状态日志，等待下次执行")
+
     @classmethod
     def _handle_job_missed(cls, event: JobEvent) -> None:
         """
@@ -212,16 +268,44 @@ class SchedulerUtil:
             error="任务错过执行时间",
         )
 
+        # 为周期性任务创建新的 pending 状态日志，等待下次执行
+        if job:
+            trigger_type = cls._get_trigger_type(job_id)
+            if trigger_type in ("cron", "interval") and job.next_run_time:
+                cls._create_job_log(
+                    job_id=job_id,
+                    job_name=job.name,
+                    trigger_type=trigger_type,
+                    status="pending",
+                )
+                log.debug(f"任务 {job_id} 已创建新的 pending 状态日志，等待下次执行")
+
     @classmethod
     def _handle_job_removed(cls, event: JobEvent) -> None:
         """
         处理任务被移除事件
+
+        注意：APScheduler 对于一次性任务（DateTrigger）会先触发 JOB_REMOVED，
+        然后再触发 JOB_SUBMITTED 和 JOB_EXECUTED。因此：
+        - 对于一次性任务，不应该在 JOB_REMOVED 时创建或更新日志
+        - 只有周期性任务在移除时才需要更新日志状态
         """
         job_id = str(event.job_id)
         jobstore = getattr(event, "jobstore", "unknown")
 
         log.info(f"任务 {job_id} 从 {jobstore} 存储器中移除")
 
+        # 检查是否是一次性任务（DateTrigger）
+        # 如果任务已经不存在，说明可能是一次性任务执行后被自动移除
+        # 这种情况下不需要更新日志，因为 JOB_EXECUTED 会处理
+        job = cls.get_job(job_id=job_id)
+        if job is None:
+            # 任务已经被移除，可能是一次性任务
+            # 不需要在这里创建日志，JOB_SUBMITTED 和 JOB_EXECUTED 会处理
+            log.debug(f"任务 {job_id} 已从调度器中移除（可能是一次性任务），跳过日志更新")
+            return
+
+        # 任务还存在，说明是周期性任务被手动移除
         # 更新执行日志
         cls._update_job_log_on_removed(job_id=job_id)
 
@@ -236,6 +320,17 @@ class SchedulerUtil:
 
         if job:
             log.info(f"任务 {job_id} ({job.name}) 已添加到 {jobstore} 存储器")
+
+            # 为周期性任务（cron/interval）创建初始的 pending 状态日志
+            trigger_type = cls._get_trigger_type(job_id)
+            if trigger_type in ("cron", "interval"):
+                cls._create_job_log(
+                    job_id=job_id,
+                    job_name=job.name,
+                    trigger_type=trigger_type,
+                    status="pending",
+                )
+                log.debug(f"任务 {job_id} 已创建初始 pending 状态日志")
         else:
             log.info(f"任务 {job_id} 已添加到 {jobstore} 存储器")
 
@@ -337,9 +432,10 @@ class SchedulerUtil:
     def _handle_all_jobs_removed(cls, event: SchedulerEvent) -> None:
         """
         处理所有任务移除事件
+        注意：清空调度器任务不应该清空执行日志，而是将所有 pending 状态的日志更新为 cancelled
         """
         log.info("所有任务已从调度器中移除")
-        cls._clear_all_job_logs()
+        cls._cancel_all_pending_job_logs()
 
     @classmethod
     def _handle_job_max_instances(cls, event: JobEvent) -> None:
@@ -473,7 +569,7 @@ class SchedulerUtil:
     @classmethod
     def _clear_all_job_logs(cls) -> None:
         """
-        清空所有任务日志
+        清空所有任务日志（仅用于手动清空，不建议使用）
         """
         try:
             from sqlalchemy.orm import Session
@@ -486,6 +582,26 @@ class SchedulerUtil:
                 log.info("所有任务日志已清空")
         except Exception as e:
             log.error(f"清空任务日志失败: {e!s}", exc_info=True)
+
+    @classmethod
+    def _cancel_all_pending_job_logs(cls) -> None:
+        """
+        将所有 pending 状态的执行日志更新为 cancelled
+        用于清空调度器任务时，不删除日志而是更新状态
+        """
+        try:
+            from sqlalchemy.orm import Session
+
+            from app.plugin.module_task.job.model import JobModel
+
+            with Session(engine) as session:
+                session.query(JobModel).filter(JobModel.status == "pending").update(
+                    {"status": "cancelled"}
+                )
+                session.commit()
+                log.info("所有待执行任务日志已标记为已取消")
+        except Exception as e:
+            log.error(f"取消待执行任务日志失败: {e!s}", exc_info=True)
 
     @classmethod
     def _get_trigger_type(cls, job_id: str) -> str:
@@ -634,7 +750,7 @@ class SchedulerUtil:
             return {"error": str(e), "raw_data": str(blob_data[:200])}
 
     @classmethod
-    def _create_job_log(cls, job_id: str, job_name: str | None = None, trigger_type: str = "manual", status: str = "running") -> int:
+    def _create_job_log(cls, job_id: str, job_name: str | None = None, trigger_type: str = "manual", status: str = "running") -> int | None:
         """
         创建执行日志
         """
@@ -642,27 +758,36 @@ class SchedulerUtil:
 
         from app.plugin.module_task.job.model import JobModel
 
-        job = cls.get_job(job_id=job_id)
-        next_run_time = str(job.next_run_time) if job and job.next_run_time else None
-        job_state = cls._get_job_state(job) if job else None
+        try:
+            job = cls.get_job(job_id=job_id)
+            next_run_time = str(job.next_run_time) if job and job.next_run_time else None
+            job_state = cls._get_job_state(job) if job else None
+            # 如果没有传入 job_name，尝试从 job 获取
+            if not job_name and job:
+                job_name = job.name
 
-        with Session(engine) as session:
-            job_log = JobModel(
-                job_id=job_id,
-                job_name=job_name,
-                trigger_type=trigger_type,
-                status=status,
-                next_run_time=next_run_time,
-                job_state=job_state,
-            )
-            session.add(job_log)
-            session.commit()
-            return job_log.id
+            with Session(engine) as session:
+                job_log = JobModel(
+                    job_id=job_id,
+                    job_name=job_name,
+                    trigger_type=trigger_type,
+                    status=status,
+                    next_run_time=next_run_time,
+                    job_state=job_state,
+                )
+                session.add(job_log)
+                session.commit()
+                log.info(f"执行日志创建成功: job_id={job_id}, id={job_log.id}")
+                return job_log.id
+        except Exception as e:
+            log.error(f"创建执行日志失败: job_id={job_id}, error={e}", exc_info=True)
+            return None
 
     @classmethod
     def _update_job_log(cls, job_id: str, status: str, result: str | None = None, error: str | None = None) -> None:
         """
-        更新执行日志（更新该 job_id 最新的 pending 或 running 状态日志）
+        更新执行日志（更新该 job_id 最新的 pending 状态日志）
+        用于周期性任务在提交执行时将 pending 更新为 running
         """
         from sqlalchemy.orm import Session
 
@@ -671,75 +796,6 @@ class SchedulerUtil:
         job = cls.get_job(job_id=job_id)
         next_run_time = str(job.next_run_time) if job and job.next_run_time else None
         job_state = cls._get_job_state(job) if job else None
-
-        with Session(engine) as session:
-            job_log = (
-                session.query(JobModel)
-                .filter(JobModel.job_id == job_id, JobModel.status.in_(['pending', 'running']))
-                .order_by(JobModel.created_time.desc())
-                .first()
-            )
-            if job_log:
-                job_log.status = status
-                if next_run_time:
-                    job_log.next_run_time = next_run_time
-                if job_state:
-                    job_log.job_state = job_state
-                if result:
-                    job_log.result = result
-                if error:
-                    job_log.error = error
-                session.commit()
-            else:
-                log.warning(f"未找到任务 {job_id} 的待执行或运行中日志记录")
-
-    @classmethod
-    def _update_latest_job_log(cls, job_id: str, status: str, result: str | None = None, error: str | None = None) -> None:
-        """
-        更新最新的执行日志（更新该 job_id 最新的一条 running 状态日志）
-        用于每次执行完成后更新状态
-        """
-        from sqlalchemy.orm import Session
-
-        from app.plugin.module_task.job.model import JobModel
-
-        job = cls.get_job(job_id=job_id)
-        next_run_time = str(job.next_run_time) if job and job.next_run_time else None
-        job_state = cls._get_job_state(job) if job else None
-
-        with Session(engine) as session:
-            job_log = (
-                session.query(JobModel)
-                .filter(JobModel.job_id == job_id, JobModel.status == "running")
-                .order_by(JobModel.created_time.desc())
-                .first()
-            )
-            if job_log:
-                job_log.status = status
-                if next_run_time:
-                    job_log.next_run_time = next_run_time
-                if job_state:
-                    job_log.job_state = job_state
-                if result:
-                    job_log.result = result
-                if error:
-                    job_log.error = error
-                session.commit()
-            else:
-                log.warning(f"未找到任务 {job_id} 的运行中日志记录")
-
-    @classmethod
-    def _update_job_log_on_removed(cls, job_id: str) -> None:
-        """
-        任务被移除时，更新最新的 pending 状态日志为 cancelled
-        注意：
-        - 只有当任务还在 pending 状态时才更新为 cancelled
-        - 一次性任务（trigger_type 为 date 或 manual）执行后会自动触发 REMOVED 事件，此时不应该标记为 cancelled
-        - REMOVED 事件可能在 SUBMITTED 之前触发，此时状态还是 pending
-        """
-        from sqlalchemy.orm import Session
-
-        from app.plugin.module_task.job.model import JobModel
 
         with Session(engine) as session:
             job_log = (
@@ -749,10 +805,141 @@ class SchedulerUtil:
                 .first()
             )
             if job_log:
-                if job_log.trigger_type in ("date", "manual"):
+                job_log.status = status
+                if next_run_time:
+                    job_log.next_run_time = next_run_time
+                if job_state:
+                    job_log.job_state = job_state
+                if result:
+                    job_log.result = result
+                if error:
+                    job_log.error = error
+                session.commit()
+            else:
+                log.warning(f"未找到任务 {job_id} 的待执行日志记录")
+
+    @classmethod
+    def _update_latest_job_log(cls, job_id: str, status: str, result: str | None = None, error: str | None = None) -> None:
+        """
+        更新最新的执行日志（更新该 job_id 最新的一条日志）
+        用于每次执行完成后更新状态
+        """
+        from sqlalchemy.orm import Session
+
+        from app.plugin.module_task.job.model import JobModel
+
+        try:
+            job = cls.get_job(job_id=job_id)
+            next_run_time = str(job.next_run_time) if job and job.next_run_time else None
+            job_state = cls._get_job_state(job) if job else None
+
+            with Session(engine) as session:
+                # 首先尝试更新 running 状态的日志
+                job_log = (
+                    session.query(JobModel)
+                    .filter(JobModel.job_id == job_id, JobModel.status == "running")
+                    .order_by(JobModel.created_time.desc())
+                    .first()
+                )
+                if job_log:
+                    job_log.status = status
+                    if next_run_time:
+                        job_log.next_run_time = next_run_time
+                    if job_state:
+                        job_log.job_state = job_state
+                    if result:
+                        job_log.result = result
+                    if error:
+                        job_log.error = error
+                    session.commit()
+                    log.info(f"执行日志更新成功: job_id={job_id}, id={job_log.id}, status={status}")
                     return
+
+                # 没有找到 running 状态的日志，尝试更新 cancelled 状态的日志
+                # 这种情况发生在 EVENT_JOB_REMOVED 先于 EVENT_JOB_SUBMITTED 触发时
+                job_log = (
+                    session.query(JobModel)
+                    .filter(JobModel.job_id == job_id, JobModel.status == "cancelled")
+                    .order_by(JobModel.created_time.desc())
+                    .first()
+                )
+                if job_log:
+                    job_log.status = status
+                    if next_run_time:
+                        job_log.next_run_time = next_run_time
+                    if job_state:
+                        job_log.job_state = job_state
+                    if result:
+                        job_log.result = result
+                    if error:
+                        job_log.error = error
+                    session.commit()
+                    log.info(f"执行日志更新成功: job_id={job_id}, id={job_log.id}, status={status}")
+                    return
+
+                # 创建新的日志记录
+                log.debug(f"未找到任务 {job_id} 的日志记录，创建新日志")
+                trigger_type = cls._get_trigger_type(job_id) if job else "manual"
+                new_log = JobModel(
+                    job_id=job_id,
+                    job_name=job.name if job else None,
+                    trigger_type=trigger_type,
+                    status=status,
+                    next_run_time=next_run_time,
+                    job_state=job_state,
+                    result=result,
+                    error=error,
+                )
+                session.add(new_log)
+                session.commit()
+                log.info(f"执行日志创建成功: job_id={job_id}, id={new_log.id}, status={status}")
+        except Exception as e:
+            log.error(f"更新执行日志失败: job_id={job_id}, status={status}, error={e}", exc_info=True)
+
+    @classmethod
+    def _update_job_log_on_removed(cls, job_id: str) -> None:
+        """
+        任务被移除时，更新最新的 pending 或 running 状态日志为 cancelled
+
+        事件触发顺序分析：
+        1. 一次性任务（manual/date）：
+           - EVENT_JOB_SUBMITTED -> 创建日志（status=running）
+           - EVENT_JOB_EXECUTED/ERROR -> 更新日志（status=success/failed）
+           - EVENT_JOB_REMOVED -> 日志已更新，不会被标记为 cancelled
+
+        2. 周期性任务（cron/interval）：
+           - EVENT_JOB_SUBMITTED -> 创建日志（status=running）
+           - EVENT_JOB_EXECUTED/ERROR -> 更新日志（status=success/failed）
+           - 下次执行 -> EVENT_JOB_SUBMITTED -> 创建新日志（status=running）
+           - EVENT_JOB_REMOVED -> 将 pending/running 标记为 cancelled
+
+        3. 特殊情况：
+           - 一次性任务在执行前被删除：running -> cancelled
+           - 周期性任务在 pending 状态被删除：pending -> cancelled
+
+        注意：
+        - 只有当任务还在 pending 或 running 状态时才更新为 cancelled
+        - 如果任务已经执行完成（success/failed/timeout），则不需要更新
+        - 如果任务已经标记为 cancelled，则不需要更新
+        """
+        from sqlalchemy.orm import Session
+
+        from app.plugin.module_task.job.model import JobModel
+
+        with Session(engine) as session:
+            job_log = (
+                session.query(JobModel)
+                .filter(
+                    JobModel.job_id == job_id,
+                    JobModel.status.in_(['pending', 'running'])
+                )
+                .order_by(JobModel.created_time.desc())
+                .first()
+            )
+            if job_log:
                 job_log.status = "cancelled"
                 session.commit()
+                log.info(f"任务 {job_id} 的执行日志已标记为已取消")
 
     @classmethod
     def get_job_status(cls, job_id: str | int) -> str:
@@ -763,7 +950,8 @@ class SchedulerUtil:
         if not job:
             return "未知"
 
-        if job_id in scheduler._jobstores[job._jobstore_alias]._paused_jobs:
+        # 判断是否暂停：next_run_time 为 None 表示任务已暂停
+        if job.next_run_time is None:
             return "暂停中"
 
         if scheduler.state == 0:
@@ -780,13 +968,7 @@ class SchedulerUtil:
         from datetime import timedelta
         trigger = DateTrigger(run_date=datetime.now() + timedelta(seconds=0.1))
         job = cls._add_job_with_trigger(job_info, trigger)
-        # 手动创建执行日志，确保调试时也能生成记录
-        cls._create_job_log(
-            job_id=str(job_info.id),
-            job_name=job_info.name,
-            trigger_type="manual",
-            status="running",
-        )
+        # 注意：不需要手动创建执行日志，EVENT_JOB_SUBMITTED 事件会自动创建
         return job
 
     @classmethod
@@ -921,6 +1103,9 @@ class SchedulerUtil:
                     job_kwargs = json.loads(kwargs_str)
                 except json.JSONDecodeError:
                     raise ValueError(f"关键字参数JSON格式无效: {kwargs_str}")
+
+        # 缓存 job_name，用于 EVENT_JOB_SUBMITTED 时获取
+        cls._job_name_cache[str(job_info.id)] = job_info.name or ""
 
         try:
             job = scheduler.add_job(
@@ -1076,8 +1261,37 @@ class SchedulerUtil:
 
     @classmethod
     def run_job_now(cls, job_id: str | int, jobstore: str | None = None) -> Job | None:
+        """
+        立即执行任务
+
+        注意：为了不改变原任务的触发器配置，我们创建一个新的临时任务来执行，
+        而不是修改原任务的 trigger。
+        """
         job = cls.get_job(job_id=job_id, jobstore=jobstore)
         if not job:
             return None
-        trigger = DateTrigger(run_date=datetime.now(), timezone="Asia/Shanghai")
-        return scheduler.modify_job(str(job_id), jobstore, trigger=trigger)
+
+        # 创建一个新的临时任务 ID
+        temp_job_id = f"{job_id}_run_now_{datetime.now().timestamp()}"
+
+        # 缓存 job_name 和原任务 ID，用于 EVENT_JOB_SUBMITTED 时获取
+        # 格式: (原任务ID, 任务名称)
+        cls._job_name_cache[temp_job_id] = (str(job_id), f"{job.name}(立即执行)")
+
+        # 创建临时任务，延迟 0.1 秒执行，确保事件监听器能够捕获事件
+        from datetime import timedelta
+        trigger = DateTrigger(run_date=datetime.now() + timedelta(seconds=0.1), timezone="Asia/Shanghai")
+        temp_job = scheduler.add_job(
+            func=job.func,
+            trigger=trigger,
+            args=job.args,
+            kwargs=job.kwargs,
+            id=temp_job_id,
+            name=f"{job.name}(立即执行)",
+            jobstore=jobstore or "default",
+            executor=job.executor,
+            max_instances=1,
+        )
+
+        log.info(f"任务 {job_id} 已触发立即执行，临时任务 ID: {temp_job_id}")
+        return temp_job
